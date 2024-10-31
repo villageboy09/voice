@@ -6,6 +6,7 @@ import speech_recognition as sr
 from pydub import AudioSegment
 from io import BytesIO
 import numpy as np
+from datetime import datetime
 
 # Initialize recognizer
 recognizer = sr.Recognizer()
@@ -22,6 +23,12 @@ async def tts_speak(text):
     except Exception as e:
         st.error(f"TTS Error: {str(e)}")
         return None
+
+# Function to get response (replace with your NLP model)
+def get_ai_response(text):
+    # Placeholder for AI response logic
+    # Replace this with your actual NLP model
+    return f"I understood that you said: {text}. How can I help you further?"
 
 # WebRTC Audio Processor for Voice Recognition
 class AudioProcessor(AudioProcessorBase):
@@ -55,7 +62,33 @@ class AudioProcessor(AudioProcessorBase):
                 try:
                     text = self.recognizer.recognize_google(audio)
                     if text:
-                        st.session_state["user_text"] = text
+                        # Only update if the text is different from the last recognized text
+                        if "last_text" not in st.session_state or st.session_state["last_text"] != text:
+                            st.session_state["last_text"] = text
+                            st.session_state["user_text"] = text
+                            # Add to chat history
+                            if "chat_history" not in st.session_state:
+                                st.session_state["chat_history"] = []
+                            
+                            # Add user message to chat history
+                            timestamp = datetime.now().strftime("%H:%M:%S")
+                            st.session_state["chat_history"].append({
+                                "role": "user",
+                                "content": text,
+                                "timestamp": timestamp
+                            })
+                            
+                            # Generate and add AI response
+                            ai_response = get_ai_response(text)
+                            st.session_state["chat_history"].append({
+                                "role": "assistant",
+                                "content": ai_response,
+                                "timestamp": timestamp
+                            })
+                            
+                            # Trigger TTS for AI response
+                            st.session_state["pending_tts"] = ai_response
+                        
                         return frame  # Return the original frame
                 except sr.UnknownValueError:
                     pass  # Silent failure for no speech detected
@@ -68,14 +101,33 @@ class AudioProcessor(AudioProcessorBase):
             st.error(f"Audio processing error: {str(e)}")
             return frame
 
+def display_chat_history():
+    if "chat_history" in st.session_state and st.session_state["chat_history"]:
+        # Create a container for chat history
+        chat_container = st.container()
+        
+        with chat_container:
+            for message in st.session_state["chat_history"]:
+                if message["role"] == "user":
+                    st.write(f'🗣️ You ({message["timestamp"]}): {message["content"]}')
+                else:
+                    st.write(f'🤖 AI ({message["timestamp"]}): {message["content"]}')
+
 def main():
     # Streamlit UI
-    st.title("Real-Time Voice Interaction with NLP")
+    st.title("Real-Time Voice Chat with AI")
     st.write("Start speaking to interact with the AI!")
 
-    # Initialize session state
+    # Initialize session states
     if "user_text" not in st.session_state:
         st.session_state["user_text"] = ""
+    if "chat_history" not in st.session_state:
+        st.session_state["chat_history"] = []
+    if "pending_tts" not in st.session_state:
+        st.session_state["pending_tts"] = None
+
+    # Create a container for the chat interface
+    chat_container = st.container()
 
     # WebRTC Streamer configuration
     webrtc_ctx = webrtc_streamer(
@@ -91,21 +143,24 @@ def main():
         ),
     )
 
-    # Display user's speech and generate response
-    if st.session_state["user_text"]:
-        user_text = st.session_state["user_text"]
-        st.write("You said:", user_text)
-        
-        # Generate AI response (placeholder - replace with your NLP model)
-        response_text = f"I heard you say: {user_text}"
-        st.write("AI Response:", response_text)
-        
-        # Generate and play TTS response
-        if st.button("Play Response"):
-            st.write("Generating audio response...")
-            audio_response = asyncio.run(tts_speak(response_text))
-            if audio_response:
-                st.audio(audio_response, format="audio/wav")
+    # Display chat history
+    with chat_container:
+        display_chat_history()
+
+    # Handle TTS response
+    if st.session_state.get("pending_tts"):
+        response_text = st.session_state["pending_tts"]
+        audio_response = asyncio.run(tts_speak(response_text))
+        if audio_response:
+            st.audio(audio_response, format="audio/wav", start_time=0)
+        st.session_state["pending_tts"] = None  # Clear pending TTS
+
+    # Add a clear chat button
+    if st.button("Clear Chat History"):
+        st.session_state["chat_history"] = []
+        st.session_state["user_text"] = ""
+        st.session_state["last_text"] = ""
+        st.rerun()
 
 if __name__ == "__main__":
     main()
