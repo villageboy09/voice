@@ -18,6 +18,9 @@ import requests
 import zipfile
 from typing import Optional, Tuple
 import time
+import shutil
+from pathlib import Path
+import sys
 
 # Set up logging
 logging.basicConfig(
@@ -32,112 +35,124 @@ VOSK_MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.1
 SESSION_TIMEOUT = 3600  # 1 hour
 MESSAGE_LIMIT = 100
 RETRY_LIMIT = 3
+MODEL_DOWNLOAD_CHUNK_SIZE = 8192
 
-def download_vosk_model() -> bool:
-    """
-    Download and extract the Vosk model if it doesn't exist.
-    Returns True if successful, False otherwise.
-    """
-    try:
-        if not os.path.exists(VOSK_MODEL_PATH):
-            st.info("Downloading Vosk model... This may take a few minutes.")
-            
-            # Download the model
-            response = requests.get(VOSK_MODEL_URL, stream=True)
+class ModelDownloader:
+    @staticmethod
+    def download_with_progress(url: str, dest_path: Path) -> bool:
+        """
+        Download a file with progress bar using streamlit.
+        """
+        try:
+            response = requests.get(url, stream=True)
             response.raise_for_status()
             
-            # Save to temporary file
-            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temp_file:
-                for chunk in response.iter_content(chunk_size=8192):
-                    temp_file.write(chunk)
-                temp_path = temp_file.name
+            # Get file size for progress bar
+            total_size = int(response.headers.get('content-length', 0))
             
-            # Extract the model
-            with zipfile.ZipFile(temp_path, 'r') as zip_ref:
-                zip_ref.extractall('.')
+            # Create progress bar
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
             
-            # Clean up
-            os.unlink(temp_path)
+            # Download with progress updates
+            downloaded_size = 0
+            with open(dest_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=MODEL_DOWNLOAD_CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        # Update progress
+                        progress = (downloaded_size / total_size) if total_size > 0 else 0
+                        progress_bar.progress(progress)
+                        progress_text.text(f"Downloading... {downloaded_size}/{total_size} bytes")
+            
+            progress_bar.empty()
+            progress_text.empty()
             return True
             
-        return True
-    except Exception as e:
-        logger.error(f"Error downloading Vosk model: {str(e)}")
-        st.error("Failed to download speech recognition model. Please check your internet connection.")
-        return False
-
-@st.cache_resource
-def load_conversation_model():
-    """Initialize AI response pipeline with proper error handling."""
-    try:
-        return pipeline(
-            "conversational",
-            model="facebook/blenderbot-400M-distill",
-            device=0 if torch.cuda.is_available() else -1
-        )
-    except Exception as e:
-        logger.error(f"Error loading conversation model: {str(e)}")
-        st.error("Failed to load AI model. Please check your internet connection.")
-        return None
-
-@st.cache_resource
-def load_vosk_model() -> Optional[Model]:
-    """Initialize Vosk model with download capability."""
-    try:
-        if not download_vosk_model():
-            return None
-        return Model(VOSK_MODEL_PATH)
-    except Exception as e:
-        logger.error(f"Error loading Vosk model: {str(e)}")
-        st.error("Failed to load speech recognition model. Please check the logs.")
-        return None
-
-def check_ffmpeg() -> bool:
-    """Verify ffmpeg installation."""
-    try:
-        ffmpeg.probe('null')
-        return True
-    except ffmpeg.Error:
-        st.error("ffmpeg is not installed. Please install it to enable audio processing.")
-        return False
-    except Exception as e:
-        logger.error(f"Error checking ffmpeg: {str(e)}")
-        return False
-
-async def generate_speech(text: str) -> Optional[bytes]:
-    """Generate speech from text with retry logic."""
-    for attempt in range(RETRY_LIMIT):
-        try:
-            communicate = edge_tts.Communicate(text, 'en-US-ChristopherNeural')
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
-                temp_path = temp_file.name
-                await communicate.save(temp_path)
-            
-            audio = AudioSegment.from_mp3(temp_path)
-            buffer = io.BytesIO()
-            audio.export(buffer, format="wav")
-            os.unlink(temp_path)
-            
-            return buffer.getvalue()
         except Exception as e:
-            logger.error(f"TTS Error (attempt {attempt + 1}/{RETRY_LIMIT}): {str(e)}")
-            if attempt == RETRY_LIMIT - 1:
-                st.warning("Unable to generate speech. Falling back to text only.")
-                return None
-            await asyncio.sleep(1)  # Wait before retry
+            logger.error(f"Download error: {str(e)}")
+            return False
 
-def get_ai_response(text: str, conversation_pipeline) -> Tuple[str, bool]:
-    """Get AI response with error handling."""
-    try:
-        response = conversation_pipeline(text)
-        return response[0]['generated_text'], True
-    except Exception as e:
-        logger.error(f"AI Response Error: {str(e)}")
-        return "I apologize, but I'm having trouble generating a response right now.", False
+    @staticmethod
+    def download_vosk_model() -> bool:
+        """
+        Download and extract the Vosk model if it doesn't exist.
+        Returns True if successful, False otherwise.
+        """
+        try:
+            model_path = Path(VOSK_MODEL_PATH)
+            if not model_path.exists():
+                st.info("Downloading Vosk model... This may take a few minutes.")
+                
+                # Create temporary directory for download
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir) / "model.zip"
+                    
+                    # Download the model
+                    if not ModelDownloader.download_with_progress(VOSK_MODEL_URL, temp_path):
+                        return False
+                    
+                    st.info("Extracting model...")
+                    # Extract the model
+                    with zipfile.ZipFile(temp_path, 'r') as zip_ref:
+                        zip_ref.extractall('.')
+                    
+                    st.success("Model downloaded and extracted successfully!")
+                    return True
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error downloading Vosk model: {str(e)}")
+            st.error(f"Failed to download speech recognition model: {str(e)}")
+            return False
+
+class ModelManager:
+    @staticmethod
+    @st.cache_resource
+    def load_conversation_model():
+        """Initialize AI response pipeline with proper error handling and GPU support."""
+        try:
+            # Check for CUDA availability
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            st.info(f"Loading conversation model on {device}...")
+            
+            model = pipeline(
+                "conversational",
+                model="facebook/blenderbot-400M-distill",
+                device=0 if device == "cuda" else -1
+            )
+            
+            st.success("Conversation model loaded successfully!")
+            return model
+            
+        except Exception as e:
+            logger.error(f"Error loading conversation model: {str(e)}")
+            st.error(f"Failed to load AI model: {str(e)}")
+            return None
+
+    @staticmethod
+    @st.cache_resource
+    def load_vosk_model() -> Optional[Model]:
+        """Initialize Vosk model with download capability and proper error handling."""
+        try:
+            if not ModelDownloader.download_vosk_model():
+                return None
+                
+            st.info("Loading speech recognition model...")
+            model = Model(VOSK_MODEL_PATH)
+            st.success("Speech recognition model loaded successfully!")
+            return model
+            
+        except Exception as e:
+            logger.error(f"Error loading Vosk model: {str(e)}")
+            st.error(f"Failed to load speech recognition model: {str(e)}")
+            return None
 
 class AudioProcessor:
     def __init__(self) -> None:
-        self.vosk_model = load_vosk_model()
+        self.vosk_model = ModelManager.load_vosk_model()
         if self.vosk_model:
             self.recognizer = KaldiRecognizer(self.vosk_model, 16000)
         self.last_process_time = time.time()
@@ -194,6 +209,37 @@ class AudioProcessor:
             logger.error(f"Audio processing error: {str(e)}")
             return None
 
+async def generate_speech(text: str) -> Optional[bytes]:
+    """Generate speech from text with retry logic."""
+    for attempt in range(RETRY_LIMIT):
+        try:
+            communicate = edge_tts.Communicate(text, 'en-US-ChristopherNeural')
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+                temp_path = temp_file.name
+                await communicate.save(temp_path)
+            
+            audio = AudioSegment.from_mp3(temp_path)
+            buffer = io.BytesIO()
+            audio.export(buffer, format="wav")
+            os.unlink(temp_path)
+            
+            return buffer.getvalue()
+        except Exception as e:
+            logger.error(f"TTS Error (attempt {attempt + 1}/{RETRY_LIMIT}): {str(e)}")
+            if attempt == RETRY_LIMIT - 1:
+                st.warning("Unable to generate speech. Falling back to text only.")
+                return None
+            await asyncio.sleep(1)  # Wait before retry
+
+def get_ai_response(text: str, conversation_pipeline) -> Tuple[str, bool]:
+    """Get AI response with error handling."""
+    try:
+        response = conversation_pipeline(text)
+        return response[0]['generated_text'], True
+    except Exception as e:
+        logger.error(f"AI Response Error: {str(e)}")
+        return "I apologize, but I'm having trouble generating a response right now.", False
+
 def init_session_state():
     """Initialize session state variables."""
     if "chat_history" not in st.session_state:
@@ -240,10 +286,39 @@ def check_message_limit() -> bool:
         return True
     return False
 
+def check_system_requirements() -> bool:
+    """Check if all system requirements are met."""
+    try:
+        # Check ffmpeg
+        ffmpeg.probe('null')
+        
+        # Check Python version
+        if sys.version_info < (3, 7):
+            st.error("Python 3.7 or higher is required.")
+            return False
+            
+        # Check available disk space
+        free_space = shutil.disk_usage('/').free
+        if free_space < 1_000_000_000:  # 1 GB
+            st.warning("Low disk space. This may affect performance.")
+            
+        return True
+        
+    except ffmpeg.Error:
+        st.error("ffmpeg is not installed. Please install it to enable audio processing.")
+        return False
+    except Exception as e:
+        logger.error(f"System check error: {str(e)}")
+        return False
+
 def main():
     try:
         st.set_page_config(page_title="Voice Chat AI", layout="wide")
         st.title("Real-Time Voice Chat with AI")
+        
+        # Check system requirements
+        if not check_system_requirements():
+            return
         
         # Initialize session state
         init_session_state()
@@ -256,12 +331,8 @@ def main():
         if check_message_limit():
             return
         
-        # Check ffmpeg installation
-        if not check_ffmpeg():
-            return
-        
         # Load AI model
-        conversation_pipeline = load_conversation_model()
+        conversation_pipeline = ModelManager.load_conversation_model()
         if not conversation_pipeline:
             return
 
