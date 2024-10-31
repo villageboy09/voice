@@ -21,6 +21,7 @@ import time
 import shutil
 from pathlib import Path
 import sys
+import subprocess
 
 # Set up logging
 logging.basicConfig(
@@ -286,11 +287,21 @@ def check_message_limit() -> bool:
         return True
     return False
 
+def check_ffmpeg_installed() -> bool:
+    """Check if ffmpeg is installed on the system."""
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
 def check_system_requirements() -> bool:
     """Check if all system requirements are met."""
     try:
         # Check ffmpeg
-        ffmpeg.probe('null')
+        if not check_ffmpeg_installed():
+            st.error("ffmpeg is not installed. Please install it to enable audio processing.")
+            return False
         
         # Check Python version
         if sys.version_info < (3, 7):
@@ -304,9 +315,6 @@ def check_system_requirements() -> bool:
             
         return True
         
-    except ffmpeg.Error:
-        st.error("ffmpeg is not installed. Please install it to enable audio processing.")
-        return False
     except Exception as e:
         logger.error(f"System check error: {str(e)}")
         return False
@@ -399,6 +407,7 @@ def main():
                         st.audio(audio_bytes, format="audio/wav")
                 
                 st.session_state["message_count"] += 1
+                st.session_st.session_state["message_count"] += 1
                 st.session_state["last_activity"] = datetime.now()
                 
                 st.rerun()
