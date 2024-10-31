@@ -5,5 +5,5 @@ transformers
 edge-tts
 vosk==0.3.45
 pydub
-python-ffmpeg
+ffmpeg-python
 numpy
