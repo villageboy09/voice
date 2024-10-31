@@ -4,3 +4,7 @@ edge-tts
 SpeechRecognition
 pydub
 ffmpeg-python
+transformers
+vosk
+mozilla-tts
+torch
