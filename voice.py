@@ -55,12 +55,13 @@ if "user_text" not in st.session_state:
 # WebRTC Streamer for capturing audio
 webrtc_ctx = webrtc_streamer(
     key="voice",
-    mode="sendonly",
+    mode="sendonly",  # Pass "sendonly" as a string
     audio_processor_factory=AudioProcessor,
     client_settings=ClientSettings(
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
     ),
 )
+
 
 # Process the response
 if st.session_state["user_text"]:
