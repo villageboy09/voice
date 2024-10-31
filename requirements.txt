@@ -1,0 +1,6 @@
+streamlit
+streamlit-webrtc
+edge-tts
+SpeechRecognition
+pydub
+ffmpeg-python
