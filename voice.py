@@ -1,79 +1,111 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, ClientSettings
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, ClientSettings, WebRtcMode
 import edge_tts
 import asyncio
 import speech_recognition as sr
 from pydub import AudioSegment
 from io import BytesIO
+import numpy as np
 
 # Initialize recognizer
 recognizer = sr.Recognizer()
 
 # Text-to-Speech function using Edge-TTS
 async def tts_speak(text):
-    tts = edge_tts.Communicate(text, voice="en-US-JennyNeural")  # Change language if needed
-    await tts.save("response.mp3")
-    audio_file = AudioSegment.from_mp3("response.mp3")
-    audio_bytes = BytesIO()
-    audio_file.export(audio_bytes, format="wav")
-    return audio_bytes.getvalue()
+    try:
+        tts = edge_tts.Communicate(text=text, voice="en-US-JennyNeural")
+        await tts.save("response.mp3")
+        audio_file = AudioSegment.from_mp3("response.mp3")
+        audio_bytes = BytesIO()
+        audio_file.export(audio_bytes, format="wav")
+        return audio_bytes.getvalue()
+    except Exception as e:
+        st.error(f"TTS Error: {str(e)}")
+        return None
 
 # WebRTC Audio Processor for Voice Recognition
 class AudioProcessor(AudioProcessorBase):
-    def __init__(self):
+    def __init__(self) -> None:
         self.recognizer = sr.Recognizer()
     
     def recv(self, frame):
-        audio = frame.to_ndarray().astype("int16")
-        audio_segment = AudioSegment(
-            audio.tobytes(), 
-            frame_rate=frame.sample_rate, 
-            sample_width=frame.sample_width,
-            channels=frame.channels
-        )
-        with sr.AudioFile(BytesIO(audio_segment.raw_data)) as source:
-            audio_data = self.recognizer.record(source)
-            try:
-                # Recognize speech
-                text = self.recognizer.recognize_google(audio_data)
-                st.session_state["user_text"] = text
-                return text
-            except sr.UnknownValueError:
-                st.error("Sorry, could not understand the audio.")
-                return ""
-            except sr.RequestError:
-                st.error("Speech recognition service error.")
-                return ""
+        try:
+            # Convert audio frame to numpy array
+            audio_data = frame.to_ndarray()
+            
+            # Ensure audio data is in the correct format
+            if audio_data.dtype != np.int16:
+                audio_data = (audio_data * 32768).astype(np.int16)
+            
+            # Create AudioSegment
+            audio_segment = AudioSegment(
+                audio_data.tobytes(), 
+                frame_rate=frame.sample_rate,
+                sample_width=2,  # 16-bit audio
+                channels=1 if len(audio_data.shape) == 1 else audio_data.shape[1]
+            )
+            
+            # Convert to format suitable for speech recognition
+            wav_bytes = BytesIO()
+            audio_segment.export(wav_bytes, format="wav")
+            wav_bytes.seek(0)
+            
+            with sr.AudioFile(wav_bytes) as source:
+                audio = self.recognizer.record(source)
+                try:
+                    text = self.recognizer.recognize_google(audio)
+                    if text:
+                        st.session_state["user_text"] = text
+                        return frame  # Return the original frame
+                except sr.UnknownValueError:
+                    pass  # Silent failure for no speech detected
+                except sr.RequestError as e:
+                    st.error(f"Speech recognition error: {str(e)}")
+                
+            return frame  # Return the original frame
+            
+        except Exception as e:
+            st.error(f"Audio processing error: {str(e)}")
+            return frame
 
-# Streamlit UI for Voice Interaction
-st.title("Real-Time Voice Interaction with NLP")
-st.write("Start speaking to interact with the AI!")
+def main():
+    # Streamlit UI
+    st.title("Real-Time Voice Interaction with NLP")
+    st.write("Start speaking to interact with the AI!")
 
-if "user_text" not in st.session_state:
-    st.session_state["user_text"] = ""
+    # Initialize session state
+    if "user_text" not in st.session_state:
+        st.session_state["user_text"] = ""
 
-# WebRTC Streamer for capturing audio
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, ClientSettings
+    # WebRTC Streamer configuration
+    webrtc_ctx = webrtc_streamer(
+        key="voice",
+        mode=WebRtcMode.SENDONLY,
+        audio_processor_factory=AudioProcessor,
+        client_settings=ClientSettings(
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={
+                "audio": True,
+                "video": False,
+            },
+        ),
+    )
 
-# WebRTC Streamer for capturing audio
-webrtc_ctx = webrtc_streamer(
-    key="voice",
-    mode="sendonly",  # "sendonly" passed directly as a string
-    audio_processor_factory=AudioProcessor,
-    client_settings=ClientSettings(
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-    ),
-)
+    # Display user's speech and generate response
+    if st.session_state["user_text"]:
+        user_text = st.session_state["user_text"]
+        st.write("You said:", user_text)
+        
+        # Generate AI response (placeholder - replace with your NLP model)
+        response_text = f"I heard you say: {user_text}"
+        st.write("AI Response:", response_text)
+        
+        # Generate and play TTS response
+        if st.button("Play Response"):
+            st.write("Generating audio response...")
+            audio_response = asyncio.run(tts_speak(response_text))
+            if audio_response:
+                st.audio(audio_response, format="audio/wav")
 
-
-# Process the response
-if st.session_state["user_text"]:
-    user_text = st.session_state["user_text"]
-    st.write("You said:", user_text)
-    
-    response_text = f"AI response: {user_text}"  # Placeholder for real NLP model response
-    st.write("Generating response...")
-
-    # Generate and play TTS response
-    audio_response = asyncio.run(tts_speak(response_text))
-    st.audio(audio_response, format="audio/wav")
+if __name__ == "__main__":
+    main()
