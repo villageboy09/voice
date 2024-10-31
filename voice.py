@@ -1,163 +1,212 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, ClientSettings, WebRtcMode
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import torch
 from transformers import pipeline
+import edge_tts
+import asyncio
 from vosk import Model, KaldiRecognizer
+import numpy as np
 import wave
 from pydub import AudioSegment
-from io import BytesIO
-import numpy as np
+import io
 from datetime import datetime
 import logging
-import subprocess
+import tempfile
+import os
+import ffmpeg
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize AI response pipeline (Hugging Face DialoGPT)
-conversation_pipeline = pipeline("conversational", model="microsoft/DialoGPT-small")
-
-# Vosk ASR model setup (download a Vosk model and specify its path)
-vosk_model = Model("path_to_vosk_model")
-
-# Text-to-Speech function using Mozilla TTS
-def tts_speak(text):
+# Initialize AI response pipeline (using a smaller model for better performance)
+@st.cache_resource
+def load_conversation_model():
     try:
-        subprocess.run(["tts", "--text", text, "--out_path", "response.wav"])
-        audio_file = AudioSegment.from_wav("response.wav")
-        audio_bytes = BytesIO()
-        audio_file.export(audio_bytes, format="wav")
-        return audio_bytes.getvalue()
+        return pipeline("conversational", model="facebook/blenderbot-400M-distill", device=0 if torch.cuda.is_available() else -1)
     except Exception as e:
-        st.error(f"TTS Error: {str(e)}")
+        logger.error(f"Error loading model: {str(e)}")
+        return None
+
+# Initialize Vosk model (with proper error handling)
+@st.cache_resource
+def load_vosk_model():
+    try:
+        model_path = "vosk-model-small-en-us-0.15"  # You should download this model
+        if not os.path.exists(model_path):
+            st.error(f"Please download the Vosk model to {model_path}")
+            return None
+        return Model(model_path)
+    except Exception as e:
+        logger.error(f"Error loading Vosk model: {str(e)}")
+        return None
+
+# Asynchronous TTS function using edge-tts
+async def generate_speech(text: str) -> bytes:
+    try:
+        communicate = edge_tts.Communicate(text, 'en-US-ChristopherNeural')
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+            temp_path = temp_file.name
+            await communicate.save(temp_path)
+        
+        # Convert MP3 to WAV using pydub
+        audio = AudioSegment.from_mp3(temp_path)
+        buffer = io.BytesIO()
+        audio.export(buffer, format="wav")
+        os.unlink(temp_path)  # Clean up temp file
+        
+        return buffer.getvalue()
+    except Exception as e:
         logger.error(f"TTS Error: {str(e)}")
         return None
 
-# Function to get response from DialoGPT model
-def get_ai_response(text):
-    response = conversation_pipeline(text)
-    return response[0]["generated_text"]
+def get_ai_response(text: str, conversation_pipeline) -> str:
+    try:
+        response = conversation_pipeline(text)
+        return response[0]['generated_text']
+    except Exception as e:
+        logger.error(f"AI Response Error: {str(e)}")
+        return "I apologize, but I'm having trouble generating a response right now."
 
-# WebRTC Audio Processor for Vosk Speech Recognition
-class AudioProcessor(AudioProcessorBase):
+class AudioProcessor:
     def __init__(self) -> None:
-        super().__init__()
-        self.recognizer = KaldiRecognizer(vosk_model, 16000)
+        self.vosk_model = load_vosk_model()
+        if self.vosk_model:
+            self.recognizer = KaldiRecognizer(self.vosk_model, 16000)
+        else:
+            st.error("Failed to load speech recognition model")
     
-    def recv(self, frame):
+    def process_audio(self, frame):
         try:
+            if not hasattr(self, 'recognizer'):
+                return None
+
+            # Convert audio to the correct format
             audio_data = frame.to_ndarray()
             if audio_data.dtype != np.int16:
                 audio_data = (audio_data * 32768).astype(np.int16)
-
-            wav_bytes = BytesIO(audio_data.tobytes())
-            wav_bytes.seek(0)
             
-            with wave.open(wav_bytes, "rb") as wf:
+            # Create WAV data in memory
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(audio_data.tobytes())
+            
+            wav_buffer.seek(0)
+            
+            # Process audio with Vosk
+            with wave.open(wav_buffer, 'rb') as wf:
                 while True:
                     data = wf.readframes(4000)
                     if len(data) == 0:
                         break
                     if self.recognizer.AcceptWaveform(data):
-                        text = self.recognizer.Result()
-                        if text:
-                            text = text.get("text", "")
-                            if "last_text" not in st.session_state or st.session_state["last_text"] != text:
-                                st.session_state["last_text"] = text
-                                st.session_state["user_text"] = text
-
-                                if "chat_history" not in st.session_state:
-                                    st.session_state["chat_history"] = []
-
-                                timestamp = datetime.now().strftime("%H:%M:%S")
-                                st.session_state["chat_history"].append({
-                                    "role": "user",
-                                    "content": text,
-                                    "timestamp": timestamp
-                                })
-
-                                ai_response = get_ai_response(text)
-                                st.session_state["chat_history"].append({
-                                    "role": "assistant",
-                                    "content": ai_response,
-                                    "timestamp": timestamp
-                                })
-
-                                st.session_state["pending_tts"] = ai_response
-                                logger.info(f"Processed speech: {text}")
-
-            return frame
-
+                        result = self.recognizer.Result()
+                        return result
+            
+            return None
+            
         except Exception as e:
             logger.error(f"Audio processing error: {str(e)}")
-            return frame
+            return None
 
 def display_chat_history():
     if "chat_history" in st.session_state and st.session_state["chat_history"]:
         for message in st.session_state["chat_history"]:
-            if message["role"] == "user":
-                st.markdown(f'🗣️ **You** ({message["timestamp"]}): {message["content"]}')
-            else:
-                st.markdown(f'🤖 **AI** ({message["timestamp"]}): {message["content"]}')
+            with st.container():
+                if message["role"] == "user":
+                    st.markdown(f"""
+                    <div style='background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin: 5px;'>
+                        🗣️ <b>You</b> ({message["timestamp"]})<br>{message["content"]}
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div style='background-color: #e6f3ff; padding: 10px; border-radius: 5px; margin: 5px;'>
+                        🤖 <b>AI</b> ({message["timestamp"]})<br>{message["content"]}
+                    </div>
+                    """, unsafe_allow_html=True)
 
 def main():
     try:
         st.set_page_config(page_title="Voice Chat AI", layout="wide")
         st.title("Real-Time Voice Chat with AI")
-        st.write("Click 'START' and begin speaking to interact with the AI!")
-
-        if "user_text" not in st.session_state:
-            st.session_state["user_text"] = ""
+        
+        # Initialize session state
         if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
-        if "pending_tts" not in st.session_state:
-            st.session_state["pending_tts"] = None
+        if "audio_processor" not in st.session_state:
+            st.session_state["audio_processor"] = AudioProcessor()
+        
+        # Load AI model
+        conversation_pipeline = load_conversation_model()
+        if not conversation_pipeline:
+            st.error("Failed to load AI model")
+            return
 
         col1, col2 = st.columns([2, 1])
         
         with col1:
+            st.markdown("### Chat History")
             chat_container = st.container()
             with chat_container:
                 display_chat_history()
 
         with col2:
+            st.markdown("### Voice Controls")
             webrtc_ctx = webrtc_streamer(
-                key="voice",
+                key="voice-chat",
                 mode=WebRtcMode.SENDONLY,
-                audio_processor_factory=AudioProcessor,
-                client_settings=ClientSettings(
-                    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-                    media_stream_constraints={
-                        "audio": True,
-                        "video": False,
-                    },
+                rtc_configuration=RTCConfiguration(
+                    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
                 ),
+                media_stream_constraints={
+                    "audio": True,
+                    "video": False,
+                },
+                async_processing=True,
+                video_processor_factory=None,
+                audio_processor_factory=lambda: st.session_state["audio_processor"]
             )
 
-            if webrtc_ctx.state.playing:
-                st.success("🎤 Listening...")
-            else:
-                st.warning("🔇 Microphone inactive")
-
-            if st.button("Clear Chat History"):
+            if st.button("Clear Chat", type="secondary"):
                 st.session_state["chat_history"] = []
-                st.session_state["user_text"] = ""
-                st.session_state["last_text"] = ""
                 st.rerun()
 
-        if st.session_state.get("pending_tts"):
-            try:
-                response_text = st.session_state["pending_tts"]
-                audio_response = tts_speak(response_text)
-                if audio_response:
-                    st.audio(audio_response, format="audio/wav")
-                st.session_state["pending_tts"] = None
-            except Exception as e:
-                logger.error(f"TTS Error: {str(e)}")
+        # Process recognized speech
+        if webrtc_ctx.state.playing:
+            result = st.session_state["audio_processor"].process_audio(webrtc_ctx.audio_frame)
+            if result:
+                # Process the speech recognition result
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                
+                # Add user message to chat
+                st.session_state["chat_history"].append({
+                    "role": "user",
+                    "content": result["text"],
+                    "timestamp": timestamp
+                })
+                
+                # Get and add AI response
+                ai_response = get_ai_response(result["text"], conversation_pipeline)
+                st.session_state["chat_history"].append({
+                    "role": "assistant",
+                    "content": ai_response,
+                    "timestamp": timestamp
+                })
+                
+                # Generate speech for AI response
+                audio_bytes = asyncio.run(generate_speech(ai_response))
+                if audio_bytes:
+                    st.audio(audio_bytes, format="audio/wav")
+                
+                st.rerun()
 
     except Exception as e:
-        st.error(f"Application Error: {str(e)}")
         logger.error(f"Main application error: {str(e)}")
+        st.error(f"An error occurred: {str(e)}")
 
 if __name__ == "__main__":
     main()
