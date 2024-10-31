@@ -1,10 +1,9 @@
 streamlit
 streamlit-webrtc
-edge-tts
-SpeechRecognition
-pydub
-ffmpeg-python
-transformers
-vosk
-mozilla-tts
 torch
+transformers
+edge-tts
+vosk==0.3.45
+pydub
+python-ffmpeg
+numpy
